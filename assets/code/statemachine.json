@@ -1,0 +1,437 @@
+{
+  "Comment": "Transcribe MP4 from S3, analyze sentiment, summarize, and store all results with progress tracking in DynamoDB",
+  "StartAt": "AddJobInfo",
+  "States": {
+    "AddJobInfo": {
+      "Type": "Pass",
+      "Parameters": {
+        "detail.$": "$.detail",
+        "Full_Job_ID.$": "States.ArrayGetItem(States.StringSplit($.detail.object.key, '/'), 1)"
+      },
+      "Next": "ExtractCleanJobId"
+    },
+    "ExtractCleanJobId": {
+      "Type": "Pass",
+      "Parameters": {
+        "detail.$": "$.detail",
+        "Full_Job_ID.$": "$.Full_Job_ID",
+        "job_parts.$": "States.StringSplit($.Full_Job_ID, '_')"
+      },
+      "Next": "CreateCleanJobId"
+    },
+    "CreateCleanJobId": {
+      "Type": "Pass",
+      "Parameters": {
+        "detail.$": "$.detail",
+        "Full_Job_ID.$": "$.Full_Job_ID",
+        "Process_ID.$": "States.Format('{}_{}_{}', States.ArrayGetItem($.job_parts, 0), States.ArrayGetItem($.job_parts, 1), States.ArrayGetItem($.job_parts, 2))",
+        "Job_ID.$": "States.Format('{}_{}_{}', States.ArrayGetItem($.job_parts, 0), States.ArrayGetItem($.job_parts, 1), States.ArrayGetItem($.job_parts, 2))"
+      },
+      "Next": "UpdateStatusTranscribing"
+    },
+    "UpdateStatusTranscribing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "minutes-table",
+        "Key": {
+          "job_id": {
+            "S.$": "$.Job_ID"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updatedAt",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "TRANSCRIBING"
+          },
+          ":updatedAt": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.UpdateResult",
+      "Next": "Transcribe",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "Transcribe": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:startTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "States.Format('{}-{}', $.Job_ID, States.UUID())",
+        "LanguageCode": "ja-JP",
+        "MediaFormat": "mp4",
+        "Media": {
+          "MediaFileUri.$": "States.Format('s3://{}/{}', $.detail.bucket.name, $.detail.object.key)"
+        },
+        "OutputBucketName": "minutes-data-bucket",
+        "OutputKey.$": "States.Format('output-transcribe/transcribe_{}.json', $.Job_ID)"
+      },
+      "ResultPath": "$.TranscriptionJob",
+      "Next": "SaveProcess ID",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "SaveProcess ID": {
+      "Type": "Pass",
+      "Next": "WaitForTranscription",
+      "Assign": {
+        "Process_ID_transcribe.$": "$.Process_ID"
+      }
+    },
+    "WaitForTranscription": {
+      "Type": "Wait",
+      "Seconds": 10,
+      "Next": "GetTranscriptionResult"
+    },
+    "GetTranscriptionResult": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:transcribe:getTranscriptionJob",
+      "Parameters": {
+        "TranscriptionJobName.$": "$.TranscriptionJob.TranscriptionJob.TranscriptionJobName"
+      },
+      "ResultPath": "$.TranscriptionResult",
+      "Next": "CheckTranscriptionStatus"
+    },
+    "CheckTranscriptionStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.TranscriptionResult.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "COMPLETED",
+          "Next": "GetTranscriptContent"
+        },
+        {
+          "Variable": "$.TranscriptionResult.TranscriptionJob.TranscriptionJobStatus",
+          "StringEquals": "FAILED",
+          "Next": "TranscriptionFailed"
+        }
+      ],
+      "Default": "WaitForTranscription"
+    },
+    "TranscriptionFailed": {
+      "Type": "Pass",
+      "Next": "UpdateStatusError"
+    },
+    "GetTranscriptContent": {
+      "Type": "Task",
+      "Parameters": {
+        "Bucket": "minutes-data-bucket",
+        "Key.$": "States.Format('output-transcribe/transcribe_{}.json', $.Process_ID)"
+      },
+      "Resource": "arn:aws:states:::aws-sdk:s3:getObject",
+      "Next": "ExtractTranscriptText",
+      "ResultPath": "$.S3Body",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "ExtractTranscriptText": {
+      "Type": "Pass",
+      "Next": "SaveTranscriptAsText",
+      "Parameters": {
+        "transcript_json.$": "States.StringToJson($.S3Body.Body)",
+        "Process_ID.$": "$.Process_ID",
+        "Job_ID.$": "$.Job_ID"
+      }
+    },
+    "SaveTranscriptAsText": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+      "Parameters": {
+        "Bucket": "minutes-data-bucket",
+        "Key.$": "States.Format('output-transcribe/transcribe_{}.txt', $.Process_ID)",
+        "Body.$": "$.transcript_json.results.transcripts[0].transcript",
+        "ContentType": "text/plain"
+      },
+      "ResultPath": "$.TranscriptSaveResult",
+      "Next": "UpdateStatusSummarizing",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "UpdateStatusSummarizing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "minutes-table",
+        "Key": {
+          "job_id": {
+            "S.$": "$.Job_ID"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updatedAt, transcript_s3_key = :transcript",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "SUMMARIZING"
+          },
+          ":updatedAt": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":transcript": {
+            "S.$": "States.Format('output-transcribe/transcribe_{}.txt', $.Process_ID)"
+          }
+        }
+      },
+      "ResultPath": "$.UpdateResult",
+      "Next": "PrepareParallel",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "PrepareParallel": {
+      "Type": "Pass",
+      "Parameters": {
+        "Job_ID.$": "$.Job_ID",
+        "Process_ID.$": "$.Process_ID",
+        "transcript_text.$": "$.transcript_json.results.transcripts[0].transcript",
+        "transcript_s3_uri.$": "States.Format('s3://minutes-data-bucket/output-transcribe/transcribe_{}.txt', $.Process_ID)"
+      },
+      "Next": "UpdateStatusAnalyzing"
+    },
+    "UpdateStatusAnalyzing": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "minutes-table",
+        "Key": {
+          "job_id": {
+            "S.$": "$.Job_ID"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updatedAt",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "ANALYZING"
+          },
+          ":updatedAt": {
+            "S.$": "$$.State.EnteredTime"
+          }
+        }
+      },
+      "ResultPath": "$.UpdateResult",
+      "Next": "ParallelAnalysis",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "ParallelAnalysis": {
+      "Type": "Parallel",
+      "ResultPath": "$.ParallelResults",
+      "Branches": [
+        {
+          "StartAt": "StartSentimentDetectionJob",
+          "States": {
+            "StartSentimentDetectionJob": {
+              "Type": "Task",
+              "Parameters": {
+                "DataAccessRoleArn": "arn:aws:iam::011152093280:role/minutes-app-team-a-iamrole_comprehend",
+                "InputDataConfig": {
+                  "S3Uri.$": "$.transcript_s3_uri",
+                  "InputFormat": "ONE_DOC_PER_FILE"
+                },
+                "LanguageCode": "ja",
+                "OutputDataConfig": {
+                  "S3Uri.$": "States.Format('s3://minutes-data-bucket/output-comprehend_temp/sentiment_{}', $.Process_ID)"
+                }
+              },
+              "Resource": "arn:aws:states:::aws-sdk:comprehend:startSentimentDetectionJob",
+              "Next": "WaitForComprehension",
+              "ResultPath": "$.SentimentDetectionJobProperties"
+            },
+            "WaitForComprehension": {
+              "Type": "Wait",
+              "Seconds": 10,
+              "Next": "DescribeSentimentDetectionJob"
+            },
+            "DescribeSentimentDetectionJob": {
+              "Type": "Task",
+              "Parameters": {
+                "JobId.$": "$.SentimentDetectionJobProperties.JobId"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:comprehend:describeSentimentDetectionJob",
+              "Next": "Choice"
+            },
+            "Choice": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.SentimentDetectionJobProperties.JobStatus",
+                  "StringEquals": "COMPLETED",
+                  "Next": "Pass"
+                }
+              ],
+              "Default": "WaitForComprehension"
+            },
+            "Pass": {
+              "Type": "Pass",
+              "Next": "CopyObject",
+              "Assign": {
+                "CopySource.$": "States.Format('minutes-data-bucket/output-comprehend_temp/sentiment_{}/011152093280-SENTIMENT-{}/output/output.tar.gz', $Process_ID_transcribe, $.SentimentDetectionJobProperties.JobId)"
+              }
+            },
+            "CopyObject": {
+              "Type": "Task",
+              "Parameters": {
+                "Bucket": "minutes-data-bucket",
+                "CopySource.$": "$CopySource",
+                "Key.$": "States.Format('output-comprehend/comprehend_{}.tar.gz', $Process_ID_transcribe)"
+              },
+              "Resource": "arn:aws:states:::aws-sdk:s3:copyObject",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "BedrockSummarize",
+          "States": {
+            "BedrockSummarize": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::bedrock:invokeModel",
+              "Parameters": {
+                "ModelId": "arn:aws:bedrock:ap-northeast-1::foundation-model/anthropic.claude-sonnet-4-5-20250929-v1:0",
+                "ContentType": "application/json",
+                "Accept": "application/json",
+                "Body": {
+                  "anthropic_version": "bedrock-2023-05-31",
+                  "max_tokens": 4096,
+                  "messages": [
+                    {
+                      "role": "user",
+                      "content": [
+                        {
+                          "type": "text",
+                          "text.$": "States.Format('以下に記載する「ここから」から「ここまで」までの文章はとある会議音声を文字起こししたデータとなっています。出力形式はHTMLタグのみで構成された文章とし、改行コード（\n）は一切含めないでください。すべて1行で出力してください。。文字起こしデータから「会議名」「議題の一覧」を考えて、各議題について先頭に「議題X：〇〇」(Xには何個めの議題か数字を入れる)を記入して、それぞれの議題に「内容」とどういった「意見や質問」があったのかとそれぞれの回答を記載し、かつその議題での「決定事項」）をまとめて下さい 「ここから」{}「ここまで」', $.transcript_text)"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Next": "SaveBedrockResult",
+              "ResultPath": "$.BedrockResult"
+            },
+            "SaveBedrockResult": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::aws-sdk:s3:putObject",
+              "Parameters": {
+                "Bucket": "minutes-data-bucket",
+                "Key.$": "States.Format('output-bedrock/summary_{}.html',$Process_ID_transcribe)",
+                "Body.$": "$.BedrockResult.Body.content[0].text",
+                "ContentType": "text/plain"
+              },
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "UpdateStatusCompleted",
+      "Catch": [
+        {
+          "ErrorEquals": ["States.ALL"],
+          "ResultPath": "$.error",
+          "Next": "UpdateStatusError"
+        }
+      ]
+    },
+    "UpdateStatusCompleted": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "minutes-table",
+        "Key": {
+          "job_id": {
+            "S.$": "$.Job_ID"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updatedAt, summary_s3_key = :summary, sentiment_s3_key = :sentiment",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "COMPLETED"
+          },
+          ":updatedAt": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":summary": {
+            "S.$": "States.Format('output-bedrock/summary_{}.html', $.Job_ID)"
+          },
+          ":sentiment": {
+            "S.$": "States.Format('output-comprehend/comprehend_{}.tar.gz', $.Job_ID)"
+          }
+        }
+      },
+      "End": true
+    },
+    "UpdateStatusError": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::dynamodb:updateItem",
+      "Parameters": {
+        "TableName": "minutes-table",
+        "Key": {
+          "job_id": {
+            "S.$": "$.Job_ID"
+          }
+        },
+        "UpdateExpression": "SET #status = :status, updated_at = :updatedAt, error_message = :error",
+        "ExpressionAttributeNames": {
+          "#status": "status"
+        },
+        "ExpressionAttributeValues": {
+          ":status": {
+            "S": "ERROR"
+          },
+          ":updatedAt": {
+            "S.$": "$$.State.EnteredTime"
+          },
+          ":error": {
+            "S.$": "States.Format('Error: {}', $.error.Error)"
+          }
+        }
+      },
+      "Next": "FailState"
+    },
+    "FailState": {
+      "Type": "Fail",
+      "Cause": "Processing failed",
+      "Error": "ProcessingError"
+    }
+  }
+}

@@ -1,0 +1,151 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>議事録AI分析</title>
+    <link rel="stylesheet" href="css/style.css">
+    <script>
+    // 認証チェック
+    (function() {
+        const urlParams = new URLSearchParams(window.location.search);
+        const code = urlParams.get('code');
+        
+        // Cognitoからのリダイレクト時（認証コードあり）
+        if (code) {
+            // 認証コードをトークンに交換
+            fetch('https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/oauth2/token', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                body: new URLSearchParams({
+                    grant_type: 'authorization_code',
+                    client_id: '7k7s2cko3vdf94lfghdac07dc0',
+                    code: code,
+                    redirect_uri: location.origin
+                })
+            })
+            .then(response => response.json())
+            .then(data => {
+                if (data.id_token) {
+                    localStorage.setItem('cognitoIdToken', data.id_token);
+                    // URLからcodeパラメータを削除してリロード
+                    window.history.replaceState({}, document.title, location.pathname);
+                    location.reload();
+                }
+            })
+            .catch(() => {
+                // エラー時はログインページへ
+                const loginUrl = 'https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/login?client_id=7k7s2cko3vdf94lfghdac07dc0&response_type=code&scope=openid&redirect_uri=' + encodeURIComponent(location.origin);
+                location.href = loginUrl;
+            });
+            return;
+        }
+        
+        // 通常の認証チェック
+        const token = localStorage.getItem('cognitoIdToken');
+        if (!token) {
+            const loginUrl = 'https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/login?client_id=7k7s2cko3vdf94lfghdac07dc0&response_type=code&scope=openid&redirect_uri=' + encodeURIComponent(location.origin);
+            location.href = loginUrl;
+            return;
+        }
+        
+        try {
+            const payload = JSON.parse(atob(token.split('.')[1]));
+            if (payload.exp <= Date.now() / 1000) {
+                localStorage.removeItem('cognitoIdToken');
+                location.reload();
+            }
+        } catch {
+            localStorage.removeItem('cognitoIdToken');
+            location.reload();
+        }
+    })();
+    </script>
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🎤 議事録AI分析</h1>
+            <button id="logout-btn" class="logout-btn">ログアウト</button>
+        </header>
+        
+        <main>
+            <!-- ファイルアップロードセクション -->
+            <section class="upload-section">
+                <h2>📁 音声ファイルアップロード</h2>
+                <div id="drop-area" class="upload-area">
+                    <input type="file" id="file-input" accept=".mp3,.mp4" style="display: none;">
+                    <div class="upload-content">
+                        <div class="upload-icon">📁</div>
+                        <p class="upload-text">ファイルをドラッグ&ドロップしてください</p>
+                        <p class="upload-or">または</p>
+                        <button id="file-select-btn" class="file-select-btn">ファイルを選択</button>
+                        <p class="file-info">MP3、MP4ファイル対応、最大100MB</p>
+                    </div>
+                    <div id="upload-status" class="upload-status"></div>
+                </div>
+            </section>
+            
+            <!-- プログレスバーセクション -->
+            <section class="progress-section" id="progress-section" style="display: none;">
+                <h2>📊 処理進捗</h2>
+                <div class="progress-container">
+                    <div class="progress-bar">
+                        <div class="progress-fill" id="progress-fill"></div>
+                    </div>
+                    <div class="progress-steps">
+                        <div class="step" id="step-upload">
+                            <div class="step-icon">📁</div>
+                            <div class="step-label">アップロード</div>
+                        </div>
+                        <div class="step" id="step-transcribe">
+                            <div class="step-icon">🎤</div>
+                            <div class="step-label">文字起こし</div>
+                        </div>
+                        <div class="step" id="step-summarize">
+                            <div class="step-icon">📝</div>
+                            <div class="step-label">要約</div>
+                        </div>
+                        <div class="step" id="step-analyze">
+                            <div class="step-icon">😊</div>
+                            <div class="step-label">感情分析</div>
+                        </div>
+                        <div class="step" id="step-complete">
+                            <div class="step-icon">✅</div>
+                            <div class="step-label">完了</div>
+                        </div>
+                    </div>
+                    <p class="progress-text" id="progress-text">処理中...</p>
+                </div>
+            </section>
+            
+            <!-- ダウンロードセクション -->
+            <section class="download-section">
+                <div class="section-header">
+                    <h2>📥 ファイルダウンロード</h2>
+                    <p>アップロード後に表示されたジョブIDを入力して、処理完了後にファイルをダウンロードしてください。</p>
+                </div>
+                <div class="download-form">
+                    <label for="job-id-input">ジョブID:</label>
+                    <input type="text" id="job-id-input" placeholder="job_xxxxxxxxx_xxxxxxxxx" class="job-id-input">
+                    <div class="download-buttons">
+                        <button id="download-transcript" class="download-btn">文字起こし</button>
+                        <button id="download-summary" class="download-btn">要約</button>
+                        <button id="download-sentiment" class="download-btn">感情分析</button>
+                    </div>
+                </div>
+            </section>
+        </main>
+    </div>
+    
+    <script src="https://sdk.amazonaws.com/js/aws-sdk-2.1000.0.min.js"></script>
+    <script src="js/config.js"></script>
+    <script src="js/s3-client.js"></script>
+    <script src="js/dynamo-client.js"></script>
+    <script src="js/auth.js"></script>
+    <script src="js/upload.js"></script>
+    <script src="js/main.js"></script>
+</body>
+</html>
