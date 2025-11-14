@@ -11,6 +11,7 @@ import * as statemachine from 'aws-cdk-lib/aws-stepfunctions';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as fs from 'fs';
+import * as cr from 'aws-cdk-lib/custom-resources';
 
 export class SpecialistCdkStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props?: cdk.StackProps) {
@@ -26,7 +27,6 @@ export class SpecialistCdkStack extends cdk.Stack {
 
     // Web用S3バケットの作成
     const webBucket = new s3.Bucket(this, 'minutes-web-bucket', {
-      bucketName: 'minutes-web-bucket',
       versioned: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
@@ -35,17 +35,22 @@ export class SpecialistCdkStack extends cdk.Stack {
 
     // データ格納用S3バケットの作成
     const dataBucket = new s3.Bucket(this, 'minutes-data-bucket', {
-      bucketName: 'minutes-data-bucket',
       versioned: true,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
       autoDeleteObjects: true,
       blockPublicAccess: s3.BlockPublicAccess.BLOCK_ALL,
-    });
-
-    //assets/web/の配下をS3にアップロード
-    new s3deploy.BucketDeployment(this, 'DeployContents', {
-      sources: [s3deploy.Source.asset('./assets/web/')],
-      destinationBucket: webBucket,
+      cors: [{
+        allowedMethods: [
+          s3.HttpMethods.GET,
+          s3.HttpMethods.PUT,
+          s3.HttpMethods.POST,
+          s3.HttpMethods.DELETE,
+          s3.HttpMethods.HEAD,
+        ],
+        allowedOrigins: ['*'],
+        allowedHeaders: ['*'],
+        exposedHeaders: ['ETag'],
+      }],
     });
 
     //CloudFrontのOACを作成
@@ -66,19 +71,6 @@ export class SpecialistCdkStack extends cdk.Stack {
       defaultRootObject: 'index.html',
       priceClass: cloudfront.PriceClass.PRICE_CLASS_200
     });
-
-    //自動生成されるS3バケットのOAI用ポリシーを削除
-    const cfnBucket = webBucket.node.defaultChild as s3.CfnBucket;
-    cfnBucket.accessControl = undefined;
-
-    //OACとディストリビューションを関連付ける
-    const cfnDistribution = distribution.node.defaultChild as cloudfront.CfnDistribution;
-
-    //自動生成されるOAIを削除
-    cfnDistribution.addPropertyOverride('DistributionConfig.Origins.0.S3OriginConfig.OriginAccessIdentity', '');
-
-    //OACの設定
-    cfnDistribution.addPropertyOverride('DistributionConfig.Origins.0.OriginAccessControlId', oac.attrId);
 
     // OACをS3バケットに関連付けるポリシーを追加
     const bucketPolicy = new s3.CfnBucketPolicy(this, 'minutes-web-bucketpolicy', {
@@ -102,9 +94,6 @@ export class SpecialistCdkStack extends cdk.Stack {
         ],
       },
     });
-
-    // バケットポリシーがバケットの後に作成されるようにする
-    bucketPolicy.node.addDependency(webBucket);
 
     //Cognito ユーザプールを定義
     const userPool = new cognito.UserPool(this, 'minutes-UserPool', {
@@ -188,6 +177,12 @@ export class SpecialistCdkStack extends cdk.Stack {
       resources: [`${dataBucket.bucketArn}/*`],
     }));
 
+    authenticatedRole.addToPolicy(new iam.PolicyStatement({
+      effect: iam.Effect.ALLOW,
+      actions: ['s3:ListBucket'],
+      resources: [dataBucket.bucketArn],
+    }));
+
     // DynamoDBアクセス権限
     authenticatedRole.addToPolicy(new iam.PolicyStatement({
       effect: iam.Effect.ALLOW,
@@ -220,6 +215,9 @@ export class SpecialistCdkStack extends cdk.Stack {
       actions: ['s3:GetObject', 's3:PutObject'],
       resources: [`${dataBucket.bucketArn}/*`],
     }));
+
+    // Bedrock Model ID (ap-northeast-1で利用可能)
+    const bedrockModelId = 'anthropic.claude-3-5-sonnet-20240620-v1:0';
 
     //ステートマシン用のIAMロールを作成
     const statemachineRole = new iam.Role(this, 'minutes-StateMachineRole', {
@@ -278,13 +276,18 @@ export class SpecialistCdkStack extends cdk.Stack {
       resources: [table.tableArn],
     }));
 
-    const file = fs.readFileSync('./assets/code/statemachine.json')
+    // statemachine.jsonを動的に生成
+    const statemachineDefinition = fs.readFileSync('./assets/code/statemachine.json', 'utf-8')
+      .replace(/\{\{BUCKET_NAME\}\}/g, dataBucket.bucketName)
+      .replace(/\{\{TABLE_NAME\}\}/g, table.tableName)
+      .replace(/\{\{COMPREHEND_ROLE_ARN\}\}/g, comprehendRole.roleArn)
+      .replace(/\{\{BEDROCK_MODEL_ID\}\}/g, bedrockModelId);
 
     //ステートマシンを作成
     const stateMachine = new statemachine.CfnStateMachine(this, 'minutes-state-machine', {
       stateMachineName: 'MinutesStateMachine',
-      definitionString:file.toString(),
-      roleArn:statemachineRole.roleArn
+      definitionString: statemachineDefinition,
+      roleArn: statemachineRole.roleArn
     });
 
     // S3バケットのEventBridge有効化
@@ -315,6 +318,57 @@ export class SpecialistCdkStack extends cdk.Stack {
       )
     ));
 
+    // config.jsを動的に生成
+    const configJs = `// AWS設定管理
+class AWSConfig {
+    constructor() {
+        this.region = '${this.region}';
+        this._isDevelopment = window.location.hostname === 'localhost' || 
+                             window.location.hostname === '127.0.0.1' ||
+                             window.location.hostname.startsWith('192.168.') ||
+                             window.location.hostname.startsWith('10.') ||
+                             window.location.hostname.startsWith('172.');
+        this.config = {
+            userPoolId: '${userPool.userPoolId}',
+            clientId: '${userPoolClient.userPoolClientId}',
+            identityPoolId: '${identityPool.ref}',
+            bucketName: '${dataBucket.bucketName}',
+            dynamoTableName: '${table.tableName}',
+            cognitoDomain: '${userPoolDomain.domainName}.auth.${this.region}.amazoncognito.com'
+        };
+    }
+    initializeAWS() {
+        if (typeof AWS === 'undefined') {
+            console.error('AWS SDK が読み込まれていません');
+            return false;
+        }
+        AWS.config.update({
+            region: this.region,
+            credentials: null
+        });
+        console.log('AWS SDK initialized');
+        return true;
+    }
+    get userPoolId() { return this.config.userPoolId; }
+    get clientId() { return this.config.clientId; }
+    get identityPoolId() { return this.config.identityPoolId; }
+    get bucketName() { return this.config.bucketName; }
+    get dynamoTableName() { return this.config.dynamoTableName; }
+    get cognitoDomain() { return this.config.cognitoDomain; }
+    get isDevelopment() { return this._isDevelopment; }
+    isProduction() { return !this._isDevelopment; }
+}
+window.awsConfig = new AWSConfig();`;
+
+    //assets/web/の配下をS3にアップロード
+    const webDeployment = new s3deploy.BucketDeployment(this, 'DeployContents', {
+      sources: [
+        s3deploy.Source.asset('./assets/web/'),
+        s3deploy.Source.data('js/config.js', configJs)
+      ],
+      destinationBucket: webBucket,
+    });
+
     // === 出力 ===
     new cdk.CfnOutput(this, 'WebsiteURL', {
       value: `https://${distribution.distributionDomainName}`,
@@ -334,6 +388,16 @@ export class SpecialistCdkStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'IdentityPoolId', {
       value: identityPool.ref,
       description: 'Cognito Identity Pool ID',
+    });
+
+    new cdk.CfnOutput(this, 'UserPoolDomain', {
+      value: `${userPoolDomain.domainName}.auth.${this.region}.amazoncognito.com`,
+      description: 'Cognito User Pool Domain',
+    });
+
+    new cdk.CfnOutput(this, 'ConfigUpdateCommand', {
+      value: `Update assets/web/js/config.js with: userPoolId='${userPool.userPoolId}', clientId='${userPoolClient.userPoolClientId}', identityPoolId='${identityPool.ref}', then redeploy`,
+      description: 'Manual config update required',
     });
 
     new cdk.CfnOutput(this, 'DataBucketName', {

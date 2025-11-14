@@ -5,23 +5,28 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>議事録AI分析</title>
     <link rel="stylesheet" href="css/style.css">
+    <script src="js/config.js"></script>
     <script>
     // 認証チェック
     (function() {
+        const config = window.awsConfig.config;
+        const region = window.awsConfig.region;
+        const cognitoDomain = config.cognitoDomain;
+        
         const urlParams = new URLSearchParams(window.location.search);
         const code = urlParams.get('code');
         
         // Cognitoからのリダイレクト時（認証コードあり）
         if (code) {
             // 認証コードをトークンに交換
-            fetch('https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/oauth2/token', {
+            fetch(`https://${cognitoDomain}/oauth2/token`, {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/x-www-form-urlencoded'
                 },
                 body: new URLSearchParams({
                     grant_type: 'authorization_code',
-                    client_id: '7k7s2cko3vdf94lfghdac07dc0',
+                    client_id: config.clientId,
                     code: code,
                     redirect_uri: location.origin
                 })
@@ -30,14 +35,12 @@
             .then(data => {
                 if (data.id_token) {
                     localStorage.setItem('cognitoIdToken', data.id_token);
-                    // URLからcodeパラメータを削除してリロード
                     window.history.replaceState({}, document.title, location.pathname);
                     location.reload();
                 }
             })
             .catch(() => {
-                // エラー時はログインページへ
-                const loginUrl = 'https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/login?client_id=7k7s2cko3vdf94lfghdac07dc0&response_type=code&scope=openid&redirect_uri=' + encodeURIComponent(location.origin);
+                const loginUrl = `https://${cognitoDomain}/login?client_id=${config.clientId}&response_type=code&scope=openid&redirect_uri=${encodeURIComponent(location.origin)}`;
                 location.href = loginUrl;
             });
             return;
@@ -46,7 +49,7 @@
         // 通常の認証チェック
         const token = localStorage.getItem('cognitoIdToken');
         if (!token) {
-            const loginUrl = 'https://ap-northeast-1izajchzjd.auth.ap-northeast-1.amazoncognito.com/login?client_id=7k7s2cko3vdf94lfghdac07dc0&response_type=code&scope=openid&redirect_uri=' + encodeURIComponent(location.origin);
+            const loginUrl = `https://${cognitoDomain}/login?client_id=${config.clientId}&response_type=code&scope=openid&redirect_uri=${encodeURIComponent(location.origin)}`;
             location.href = loginUrl;
             return;
         }
